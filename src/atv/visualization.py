@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -113,7 +115,7 @@ def save_overview_windows(
 
 
 def save_reconstructed_frames(out_dir: Path, frames: list[np.ndarray]) -> None:
-    """Save reconstructed frames as grayscale PNG images."""
+    """Save reconstructed frames as grayscale PNG images (pixel-accurate layout)."""
     if not frames:
         return
     try:
@@ -121,14 +123,141 @@ def save_reconstructed_frames(out_dir: Path, frames: list[np.ndarray]) -> None:
     except Exception:
         return
 
+    dpi = 130
     for i, fr in enumerate(frames, 1):
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.imshow(fr, cmap="gray", aspect="auto", vmin=0, vmax=255)
+        u = np.asarray(fr, dtype=np.uint8)
+        if u.ndim != 2:
+            continue
+        h_px, w_px = int(u.shape[0]), int(u.shape[1])
+        fig_w = max(5.0, min(16.0, w_px / dpi))
+        fig_h = max(4.0, min(24.0, h_px / dpi))
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
+        ax.imshow(
+            u,
+            cmap="gray",
+            vmin=0,
+            vmax=255,
+            interpolation="nearest",
+            aspect="equal",
+            origin="upper",
+        )
         ax.set_title(f"Reconstructed frame {i}")
-        ax.set_xlabel("Sample in active line")
+        ax.set_xlabel("Active line (resampled pixels)")
         ax.set_ylabel("Line")
         ax.set_xticks([])
         ax.set_yticks([])
-        fig.tight_layout()
-        fig.savefig(out_dir / f"reconstructed_frame_{i}.png", dpi=150)
+        fig.subplots_adjust(left=0.06, right=0.99, top=0.93, bottom=0.06)
+        fig.savefig(out_dir / f"reconstructed_frame_{i}.png", dpi=dpi, pad_inches=0.02)
         plt.close(fig)
+
+
+def save_reconstructed_video(
+    out_dir: Path,
+    frames: list[np.ndarray],
+    fps: float,
+    filename: str = "reconstructed_frames.mp4",
+    crf: int = 18,
+) -> Path | None:
+    """Write reconstructed uint8 grayscale frames as one H.264 MP4 (requires ``ffmpeg`` on PATH).
+
+    Pads all frames to the same height and width (top-left aligned) so codecs accept
+    a regular stream. Uses short GOP for few-frame previews to limit temporal pumping.
+    """
+    if not frames or fps <= 0:
+        return None
+    if shutil.which("ffmpeg") is None:
+        return None
+    max_h = max(int(f.shape[0]) for f in frames)
+    max_w = max(int(f.shape[1]) for f in frames)
+    # yuv420p (libx264 default) requires even width and height.
+    max_h = (max_h + 1) // 2 * 2
+    max_w = (max_w + 1) // 2 * 2
+    if max_h < 2 or max_w < 2:
+        return None
+    out_path = out_dir / filename
+    fps_c = float(np.clip(float(fps), 0.5, 120.0))
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-s",
+        f"{max_w}x{max_h}",
+        "-pix_fmt",
+        "rgb24",
+        "-r",
+        str(fps_c),
+        "-i",
+        "-",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-crf",
+        str(int(np.clip(crf, 10, 35))),
+        "-preset",
+        "medium",
+        "-tune",
+        "grain",
+        "-movflags",
+        "+faststart",
+        str(out_path),
+    ]
+    # Short clips: all-intra avoids B-frame flicker when only a handful of frames exist.
+    if len(frames) <= 64:
+        idx = cmd.index(str(out_path))
+        cmd[idx:idx] = ["-g", "1", "-keyint_min", "1", "-sc_threshold", "0"]
+    stderr_path = out_dir / "ffmpeg_encoding.stderr.log"
+    stderr_file = None
+    try:
+        stderr_file = open(stderr_path, "w", encoding="utf-8")
+    except OSError:
+        pass
+    stderr_arg = stderr_file if stderr_file is not None else subprocess.DEVNULL
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_arg,
+        )
+    except OSError:
+        if stderr_file is not None:
+            stderr_file.close()
+        return None
+    assert proc.stdin is not None
+    write_ok = True
+    try:
+        for fr in frames:
+            u = np.asarray(fr, dtype=np.uint8)
+            if u.ndim != 2:
+                continue
+            h, w = int(u.shape[0]), int(u.shape[1])
+            plane = np.zeros((max_h, max_w), dtype=np.uint8)
+            plane[:h, :w] = u
+            rgb = np.stack([plane, plane, plane], axis=-1)
+            proc.stdin.write(rgb.tobytes())
+    except BrokenPipeError:
+        write_ok = False
+        proc.kill()
+    finally:
+        proc.stdin.close()
+    ret = proc.wait()
+    if stderr_file is not None:
+        stderr_file.close()
+    if not write_ok or ret != 0 or not out_path.is_file():
+        if out_path.is_file():
+            out_path.unlink(missing_ok=True)
+        return None
+    # Success: drop empty noise log if present.
+    try:
+        if stderr_path.is_file() and stderr_path.stat().st_size == 0:
+            stderr_path.unlink()
+    except OSError:
+        pass
+    return out_path

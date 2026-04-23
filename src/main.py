@@ -5,7 +5,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
+
+# Support ``python3 -m src.main`` and running from any working directory.
+_src = str(Path(__file__).resolve().parent)
+if _src not in sys.path:
+    sys.path.insert(0, _src)
 
 from atv import run_pipeline
 
@@ -24,6 +30,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=3,
         help="Maximum reconstructed frames to save (<=0 means no limit, process full signal)",
     )
+    parser.add_argument(
+        "--video-fps",
+        type=float,
+        default=-1.0,
+        help="FPS for reconstructed_frames.mp4: <0 = auto from line time (PAL 25 / NTSC ~29.97), 0 = no video, >0 = explicit (requires ffmpeg)",
+    )
     return parser
 
 
@@ -37,6 +49,7 @@ def main() -> None:
         windows_count=args.windows_count,
         window_ms=args.window_ms,
         max_frames=args.max_frames,
+        video_fps=args.video_fps,
     )
 
     print("Done.")

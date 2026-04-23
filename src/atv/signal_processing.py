@@ -74,6 +74,26 @@ def estimate_line_period(hsync_starts: np.ndarray, fs: float) -> float:
     return float(np.median(plausible))
 
 
+def estimate_broadcast_video_fps(line_period_us: float | None) -> float:
+    """Nominal full-frame playback rate from HSYNC line time (ITU-R BT.470 class timing).
+
+    PAL uses ~64 µs per line (15.625 kHz); NTSC ~63.556 µs. We map those to 25 Hz
+    and ~29.97 Hz for preview video when the user does not set ``--video-fps``.
+    """
+    if line_period_us is None or not np.isfinite(line_period_us):
+        return 25.0
+    # PAL ~64 µs line; NTSC ~63.556 µs (BT.470 class systems).
+    if line_period_us >= 63.9:
+        return 25.0
+    if 63.0 <= line_period_us < 63.9:
+        return 30.0 / 1.001
+    # Fallback: ~625-line raster heuristic.
+    t_frame_us = float(line_period_us) * 625.0
+    if t_frame_us > 1e-3:
+        return float(np.clip(1e6 / t_frame_us, 1.0, 60.0))
+    return 25.0
+
+
 def periodicity_score(x: np.ndarray, lag: int) -> float:
     """Normalized autocorrelation-like periodicity score."""
     if lag <= 0:
